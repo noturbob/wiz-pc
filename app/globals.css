@@ -1,26 +1,73 @@
 @import "tailwindcss";
 
+/* The room is unlit by default — the bulbs are the content, not the chrome.
+   Light mode flips to a "daylight room" look rather than a generic light theme. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --plaster: #1f1c24;
+  --wall: #2b2731;
+  --linen: #eae3d4;
+  --dusk: #8c8597;
+  --filament: #ffb661;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-plaster: var(--plaster);
+  --color-wall: var(--wall);
+  --color-linen: var(--linen);
+  --color-dusk: var(--dusk);
+  --color-filament: var(--filament);
+  --font-sans: var(--font-bricolage);
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --plaster: #eae3d4;
+    --wall: #ded5c2;
+    --linen: #211d27;
+    --dusk: #6b6478;
+    --filament: #c9752f;
   }
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--plaster);
+  color: var(--linen);
+}
+
+/* Bare range inputs, styled as the kelvin/hue strips and brightness slider. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 0.75rem;
+  border-radius: 9999px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 9999px;
+  background: var(--linen);
+  border: 2px solid var(--plaster);
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 9999px;
+  background: var(--linen);
+  border: 2px solid var(--plaster);
+  cursor: pointer;
+}
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--filament);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
