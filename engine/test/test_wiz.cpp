@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <netinet/in.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #include "color.hpp"
+#include "effects.hpp"
 #include "scheduler.hpp"
 #include "wiz.hpp"
 
@@ -122,6 +124,75 @@ void test_scheduler_latest_wins_and_rate_limits() {
     ::close(rx);
 }
 
+void test_oklab_mix_endpoints_match_inputs() {
+    color::Rgb a{1.f, 0.f, 0.f}; // red
+    color::Rgb b{0.f, 0.5f, 1.f}; // blue-ish
+    color::Rgb at0 = color::mixOklab(a, b, 0.f);
+    color::Rgb at1 = color::mixOklab(a, b, 1.f);
+    assert(std::fabs(at0.r - a.r) < 0.01f && std::fabs(at0.g - a.g) < 0.01f && std::fabs(at0.b - a.b) < 0.01f);
+    assert(std::fabs(at1.r - b.r) < 0.01f && std::fabs(at1.g - b.g) < 0.01f && std::fabs(at1.b - b.b) < 0.01f);
+}
+
+void test_effects_parse_roundtrip() {
+    assert(effects::parse("aurora") == effects::Id::Aurora);
+    assert(effects::name(effects::Id::Aurora) == "aurora");
+    assert(effects::parse("not-a-real-effect") == effects::Id::None);
+}
+
+void test_rainbow_varies_across_room_position() {
+    effects::BulbEffectState state;
+    color::Rgb left = effects::evaluate(effects::Id::Rainbow, 0.0, 0.f, state);
+    color::Rgb right = effects::evaluate(effects::Id::Rainbow, 0.0, 0.5f, state);
+    // Same instant, different position along the room -> different hue.
+    assert(color::rgbToHsv(left).h != color::rgbToHsv(right).h);
+}
+
+void test_aurora_stays_in_green_violet_band() {
+    effects::BulbEffectState state;
+    for (double t = 0.0; t < 20.0; t += 1.3) {
+        for (float pos : {0.f, 0.3f, 0.7f, 1.f}) {
+            color::Rgb c = effects::evaluate(effects::Id::Aurora, t, pos, state);
+            color::Hsv hsv = color::rgbToHsv(c);
+            assert(hsv.h >= 55.f && hsv.h <= 245.f); // never strays into red/magenta
+        }
+    }
+}
+
+void test_storm_ambient_is_dim_between_strikes() {
+    effects::BulbEffectState state;
+    state.nextStrikeAt = 1000.0; // push the first strike far into the future
+    color::Rgb c = effects::evaluate(effects::Id::Storm, 0.0, 0.f, state);
+    assert(color::rgbToHsv(c).v < 0.2f); // dark and stormy, not lit up
+}
+
+void test_storm_strike_decays_to_ambient() {
+    effects::BulbEffectState state;
+    state.nextStrikeAt = 0.0; // force an immediate strike
+    color::Rgb flash = effects::evaluate(effects::Id::Storm, 0.0, 0.f, state);
+    assert(color::rgbToHsv(flash).v > 0.9f); // the strike itself is a bright flash
+    float lastValue = color::rgbToHsv(flash).v;
+    for (int i = 0; i < 20; ++i) {
+        color::Rgb c = effects::evaluate(effects::Id::Storm, 0.001, 0.f, state);
+        float v = color::rgbToHsv(c).v;
+        assert(v <= lastValue + 1e-4f); // strictly decaying, never re-brightens on its own
+        lastValue = v;
+    }
+    assert(lastValue < 0.2f); // settled back to ambient
+}
+
+void test_strobe_is_capped_and_alternates() {
+    // Sampled across a full cycle at 2Hz, strobe must actually turn off at
+    // some point — a stuck-on "strobe" would defeat the photosensitivity cap.
+    bool sawOff = false, sawOn = false;
+    effects::BulbEffectState state; // unused by strobe, but evaluate() needs one
+    for (double t = 0.0; t < 0.5; t += 0.05) {
+        color::Rgb c = effects::evaluate(effects::Id::Strobe, t, 0.f, state);
+        if (color::rgbToHsv(c).v < 0.05f) sawOff = true;
+        else sawOn = true;
+    }
+    assert(sawOff && sawOn);
+}
+
 } // namespace
 
 int main() {
@@ -132,6 +203,13 @@ int main() {
     test_color_saturated_uses_rgb();
     test_color_zero_brightness_is_off();
     test_scheduler_latest_wins_and_rate_limits();
+    test_oklab_mix_endpoints_match_inputs();
+    test_effects_parse_roundtrip();
+    test_rainbow_varies_across_room_position();
+    test_aurora_stays_in_green_violet_band();
+    test_storm_ambient_is_dim_between_strikes();
+    test_storm_strike_decays_to_ambient();
+    test_strobe_is_capped_and_alternates();
     std::printf("all tests passed\n");
     return 0;
 }

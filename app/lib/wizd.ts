@@ -5,10 +5,27 @@
 import { useSyncExternalStore } from "react";
 
 export type Bulb = { index: number; ip: string; mac: string };
+
+// Must match the ordinal order of wiz::effects::Id in engine/src/effects.hpp —
+// the wire only carries the byte, not the name.
+export const EFFECTS = [
+  "none",
+  "rainbow",
+  "aurora",
+  "rainbow-aurora",
+  "candle",
+  "fireplace",
+  "ocean",
+  "breathe",
+  "storm",
+  "strobe",
+] as const;
+export type EffectName = (typeof EFFECTS)[number];
+
 // One bulb's live state, as mirrored by the daemon's 30Hz binary frame:
 // r/g/b/dim are all 0..255 on the wire even though dim is really a 0..100
 // percentage server-side — see buildLiveFrame in engine/src/main.cpp.
-export type LiveBulb = { r: number; g: number; b: number; dim: number };
+export type LiveBulb = { r: number; g: number; b: number; dim: number; effect: EffectName };
 
 type Listener = () => void;
 
@@ -67,17 +84,23 @@ class WizConnection {
     if (msg.type === "state" && Array.isArray(msg.bulbs)) {
       this.bulbs = msg.bulbs;
       if (this.live.length !== this.bulbs.length) {
-        this.live = this.bulbs.map(() => ({ r: 0, g: 0, b: 0, dim: 0 }));
+        this.live = this.bulbs.map(() => ({ r: 0, g: 0, b: 0, dim: 0, effect: "none" }));
       }
       this.emitState();
     }
   }
 
   private handleFrame(bytes: Uint8Array) {
-    for (let i = 0; i + 4 < bytes.length; i += 5) {
+    for (let i = 0; i + 5 < bytes.length; i += 6) {
       const index = bytes[i];
       if (index >= this.live.length) continue;
-      this.live[index] = { r: bytes[i + 1], g: bytes[i + 2], b: bytes[i + 3], dim: bytes[i + 4] };
+      this.live[index] = {
+        r: bytes[i + 1],
+        g: bytes[i + 2],
+        b: bytes[i + 3],
+        dim: bytes[i + 4],
+        effect: EFFECTS[bytes[i + 5]] ?? "none",
+      };
     }
     this.emitFrame();
   }
@@ -107,6 +130,12 @@ class WizConnection {
     this.ws.send(
       JSON.stringify({ type: "set", targets, r: rgb[0], g: rgb[1], b: rgb[2], brightness }),
     );
+  }
+
+  // Starts (or, with "none", stops) an effect on `targets` (empty = all bulbs).
+  effect(targets: number[], name: EffectName) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "effect", targets, name }));
   }
 }
 

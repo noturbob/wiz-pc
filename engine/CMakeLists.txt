@@ -17,7 +17,7 @@ FetchContent_MakeAvailable(glaze)
 
 find_package(OpenSSL REQUIRED) # SHA1 for the WebSocket handshake only
 
-add_library(wizcore src/wiz.cpp src/server.cpp)
+add_library(wizcore src/wiz.cpp src/server.cpp src/effects.cpp)
 target_include_directories(wizcore PUBLIC src)
 target_link_libraries(wizcore PUBLIC glaze::glaze OpenSSL::Crypto)
 target_compile_features(wizcore PUBLIC cxx_std_23)

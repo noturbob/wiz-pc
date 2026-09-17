@@ -2,16 +2,19 @@
 //
 // Runs a WebSocket server for the dashboard (server.cpp) and drives a
 // Scheduler of bulbs (real, discovered over UDP, or --fake for hardware-free
-// development). Effects (step 3+), audio (step 4) and screen sync (step 5)
-// will add their own producer threads later; for now everything runs on the
-// WsServer's own event loop, which is correct until there's a second real
-// producer of bulb state.
+// development). Effects are pure math evaluated inline in the same 30Hz tick
+// that already runs (see effects.hpp) — no separate thread, since there's no
+// blocking work involved. Audio (step 4) and screen sync (step 5) genuinely
+// need blocking OS capture threads, which is where a real producer thread
+// (and the lock-free handoff the plan describes) actually earns its keep.
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <functional>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
@@ -21,6 +24,7 @@
 #include <glaze/glaze.hpp>
 
 #include "color.hpp"
+#include "effects.hpp"
 #include "scheduler.hpp"
 #include "server.hpp"
 #include "wiz.hpp"
@@ -58,8 +62,14 @@ void runFakeBulb(int index, uint16_t port) {
     ::close(fd);
 }
 
-// Incoming dashboard command: {"type":"set","targets":[0,2],"r":1,"g":0,"b":0,"brightness":0.8}
-// An empty (or absent) targets list means "all bulbs".
+// Probed first so we know which full struct to parse a message into —
+// glaze errors on fields a struct doesn't declare, so SetCommand can't just
+// absorb an {"type":"effect",...} message and vice versa.
+struct TypeOnly { std::string type; };
+
+// {"type":"set","targets":[0,2],"r":1,"g":0,"b":0,"brightness":0.8}
+// An empty (or absent) targets list means "all bulbs". Sending this cancels
+// any effect running on those bulbs — manual control always wins.
 struct SetCommand {
     std::string type;
     std::vector<int> targets;
@@ -67,12 +77,61 @@ struct SetCommand {
     float brightness = 1.f;          // 0..1
 };
 
-// Live mirror sent to the dashboard at a fixed rate: one 5-byte record per
-// bulb, [index, r, g, b, dimming]. The UI reads this in place of re-deriving
-// state from JSON, so it always shows exactly what the bulb was told to do.
-std::vector<uint8_t> buildLiveFrame(const wiz::Scheduler& sched) {
+// {"type":"effect","name":"aurora","targets":[]} — "none" cancels back to
+// manual control (the bulb just keeps showing its last colour).
+struct EffectCommand {
+    std::string type;
+    std::string name;
+    std::vector<int> targets;
+};
+
+constexpr float kEffectBrightness = 0.85f; // each effect shapes its own value/lightness internally
+
+// Per-bulb effect state, sized once the bulb count is known. Kept in main.cpp
+// (not the Scheduler) since the Scheduler only knows about wire timing, not colour.
+struct EffectTrack {
+    std::vector<wiz::effects::Id> id;
+    std::vector<std::chrono::steady_clock::time_point> startedAt;
+    std::vector<wiz::effects::BulbEffectState> state;
+
+    explicit EffectTrack(size_t count)
+        : id(count, wiz::effects::Id::None), startedAt(count), state(count) {}
+
+    void start(size_t i, wiz::effects::Id newId) {
+        id[i] = newId;
+        startedAt[i] = std::chrono::steady_clock::now();
+        state[i] = {};
+    }
+
+    void stop(size_t i) { id[i] = wiz::effects::Id::None; }
+
+    double secondsRunning(size_t i) const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt[i]).count();
+    }
+};
+
+float posAlongRoom(size_t index, size_t count) {
+    return count <= 1 ? 0.f : static_cast<float>(index) / static_cast<float>(count - 1);
+}
+
+// Advances every bulb currently running an effect and pushes its colour into
+// the scheduler, exactly as a manual "set" would.
+void tickEffects(wiz::Scheduler& sched, EffectTrack& effects) {
+    for (size_t i = 0; i < sched.size(); ++i) {
+        if (effects.id[i] == wiz::effects::Id::None) continue;
+        float pos = posAlongRoom(i, sched.size());
+        wiz::color::Rgb rgb = wiz::effects::evaluate(effects.id[i], effects.secondsRunning(i), pos, effects.state[i]);
+        sched.push(i, wiz::color::toPilot(rgb, kEffectBrightness));
+    }
+}
+
+// Live mirror sent to the dashboard at a fixed rate: one 6-byte record per
+// bulb, [index, r, g, b, dimming, effectId]. The UI reads this in place of
+// re-deriving state from JSON, so it always shows exactly what the bulb was
+// told to do — including which mode (if any) is driving it.
+std::vector<uint8_t> buildLiveFrame(const wiz::Scheduler& sched, const EffectTrack& effects) {
     std::vector<uint8_t> frame;
-    frame.reserve(sched.size() * 5);
+    frame.reserve(sched.size() * 6);
     for (size_t i = 0; i < sched.size(); ++i) {
         const wiz::Pilot& p = sched.pending(i);
         wiz::color::Rgb rgb = p.useTemp ? wiz::color::kelvinToRgb(static_cast<float>(p.kelvin))
@@ -83,6 +142,7 @@ std::vector<uint8_t> buildLiveFrame(const wiz::Scheduler& sched) {
         frame.push_back(static_cast<uint8_t>(std::lround(std::clamp(rgb.g, 0.f, 1.f) * 255.f)));
         frame.push_back(static_cast<uint8_t>(std::lround(std::clamp(rgb.b, 0.f, 1.f) * 255.f)));
         frame.push_back(dim);
+        frame.push_back(static_cast<uint8_t>(effects.id[i]));
     }
     return frame;
 }
@@ -99,27 +159,48 @@ std::string buildStateJson(const wiz::Scheduler& sched) {
     return glz::write_json(msg).value_or("{}");
 }
 
+// Calls `fn(index)` for each target index, or every bulb if `targets` is empty.
+void forEachTarget(const std::vector<int>& targets, size_t bulbCount, const std::function<void(size_t)>& fn) {
+    if (targets.empty()) {
+        for (size_t i = 0; i < bulbCount; ++i) fn(i);
+    } else {
+        for (int t : targets)
+            if (t >= 0 && static_cast<size_t>(t) < bulbCount) fn(static_cast<size_t>(t));
+    }
+}
+
 void serve(wiz::Scheduler& sched, const std::string& bindAddr, uint16_t port) {
     wiz::WsServer server(bindAddr, port);
+    EffectTrack effects(sched.size());
 
     server.onMessage([&](std::string_view json) {
-        SetCommand cmd{};
-        if (glz::read_json(cmd, json)) return; // malformed — ignore
-        if (cmd.type != "set") return;
+        // Glaze errors on unknown keys by default, and this probe only ever
+        // declares "type" — every other field in a "set" or "effect" message
+        // would otherwise make it (wrongly) reject the whole message.
+        TypeOnly probe{};
+        if (glz::read<glz::opts{.error_on_unknown_keys = false}>(probe, json)) return;
 
-        wiz::Pilot pilot = wiz::color::toPilot({cmd.r, cmd.g, cmd.b}, cmd.brightness);
-        if (cmd.targets.empty()) {
-            for (size_t i = 0; i < sched.size(); ++i) sched.push(i, pilot);
-        } else {
-            for (int t : cmd.targets)
-                if (t >= 0 && static_cast<size_t>(t) < sched.size()) sched.push(static_cast<size_t>(t), pilot);
+        if (probe.type == "set") {
+            SetCommand cmd{};
+            if (glz::read_json(cmd, json)) return;
+            wiz::Pilot pilot = wiz::color::toPilot({cmd.r, cmd.g, cmd.b}, cmd.brightness);
+            forEachTarget(cmd.targets, sched.size(), [&](size_t i) {
+                effects.stop(i); // manual control always wins over a running effect
+                sched.push(i, pilot);
+            });
+        } else if (probe.type == "effect") {
+            EffectCommand cmd{};
+            if (glz::read_json(cmd, json)) return;
+            wiz::effects::Id id = wiz::effects::parse(cmd.name);
+            forEachTarget(cmd.targets, sched.size(), [&](size_t i) { effects.start(i, id); });
         }
     });
 
     server.onTick(
         [&] {
+            tickEffects(sched, effects);
             sched.tick();
-            server.broadcastBinary(buildLiveFrame(sched));
+            server.broadcastBinary(buildLiveFrame(sched, effects));
         },
         /*hz=*/30);
 

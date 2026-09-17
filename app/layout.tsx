@@ -1,11 +1,9 @@
 import type { Metadata } from "next";
-import { Bricolage_Grotesque } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-const bricolage = Bricolage_Grotesque({
-  variable: "--font-bricolage",
-  subsets: ["latin"],
-});
+const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
+const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
   title: "wiz-pc",
@@ -17,9 +15,11 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // Dark by default — this is a control panel, not editorial content, and
+  // matches the rest of the shadcn dashboard convention.
   return (
-    <html lang="en" className={`${bricolage.variable} h-full antialiased`}>
-      <body className="min-h-full flex flex-col">{children}</body>
+    <html lang="en" className={`dark h-full ${geistSans.variable} ${geistMono.variable}`}>
+      <body className="min-h-full flex flex-col antialiased">{children}</body>
     </html>
   );
 }
